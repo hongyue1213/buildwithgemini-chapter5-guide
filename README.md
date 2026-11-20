@@ -1,172 +1,136 @@
-# BuildWithGemini Chapter 5 專案技術文件與架構彙整
+# Build with Gemini · Track 5: Agent Masterclass 講義深度審查與全解析
 
-本專案為 **BuildWithGemini（Chapter 5）** 代理人導向提案生成系統（Pitch Generator System）。系統採用多代理人協同編排架構，整合 Google Gemini Enterprise Agent Platform、Agent-to-Agent (A2A) 通訊協定、BigQuery 遙測串流與品牌漂移審查、多層安全閘門（PreToolUse 與 PII Scrubber）、人機協同關卡（HITL），以及權杖經濟學（Tokenomics）最佳化機制。
+本文件依據官方最新線上教材 [https://storage.googleapis.com/bwg-track5-demo-guide/index.html](https://storage.googleapis.com/bwg-track5-demo-guide/index.html) 進行全文審閱、架構比對與結構化重新整理，解析各章節的核心設計模式（Pattern）、提示詞設計範例（Prompts）以及底層實作機制。
 
 ---
 
 ## 目錄
-1. [系統整體架構與工作流程](#1-系統整體架構與工作流程)
-2. [專案運用之各項資源與技能 (Skills)](#2-專案運用之各項資源與技能-skills)
-3. [Agentic Workflow 核心優勢與設計目的](#3-agentic-workflow-核心優勢與設計目的)
-4. [核心技能原始定義 (Skill MD)](#4-核心技能原始定義-skill-md)
-5. [安全防護與治理機制](#5-安全防護與治理機制)
-6. [權杖經濟學 (Tokenomics) 實作與基準測試](#6-權杖經濟學-tokenomics-實作與基準測試)
+1. [講義核心架構與學習目標](#1-講義核心架構與學習目標)
+2. [實驗環境與 Antigravity 2.0 協同範式](#2-實驗環境與-antigravity-20-協同範式)
+3. [Starter Baseline 基準應用解析](#3-starter-baseline-基準應用解析)
+4. [Module 1: 專責代理人團隊擴展 (Skills & A2A)](#4-module-1-專責代理人團隊擴展-skills--a2a)
+5. [Module 2: 企業級觀測與行為審計 (BigQuery & AI.SCORE)](#5-module-2-企業級觀測與行為審計-bigquery--aiscore)
+6. [Module 3: 管線加固與縱深防禦 (Security & HITL)](#6-module-3-管線加固與縱深防禦-security--hitl)
+7. [Module 4: 規模化與權杖經濟學最佳化 (Tokenomics)](#7-module-4-規模化與權杖經濟學最佳化-tokenomics)
+8. [自我排錯與 Lab Helper 漸進式引導機制](#8-自我排錯與-lab-helper-漸進式引導機制)
+9. [本地資源檔案索引](#9-本地資源檔案索引)
 
 ---
 
-## 1. 系統整體架構與工作流程
+## 1. 講義核心架構與學習目標
 
-系統工作流程建立於 ADK (Agent Development Kit) 圖形拓撲上，將單一複雜的行銷提案任務拆解為專職代理人管線：
+本課程設定情境為創意行銷廣告公司建構的行銷提案自動化系統 **Agentic Pitch Generator**。
+原始 Prototype 雖已具備 4 個並行代理人、`LoopGuard` 循環保護與 Google Cloud Storage 圖檔持久化，但缺乏品牌規則、自動合規評估、微服務隔離、BigQuery 多模態分析、安全閘門與 Token 成本控制。
 
-```mermaid
-graph TD
-    User([使用者輸入 Brief]) --> PII[PII Scrubber 敏感資料去識別化]
-    PII --> CD[Creative Director 創意總監]
-    CD --> HITL{HITL Approval Gate 人機協同審核}
-    HITL -- 拒絕 (No) --> FailClosed[閉合終止 status: rejected]
-    HITL -- 核准 (Yes) --> BS[Brand Strategist 品牌策略師]
-    BS --> Fork((並行分支))
-    Fork --> CW[Copywriter 社群文案師]
-    Fork --> VD[Visual Director 視覺總監 A2A 遠端服務]
-    CW --> Assemble[Assemble 聚合節點]
-    VD --> Assemble
-    Assemble --> PKG[Package 成果包裝]
-    PKG --> Telemetry[(BigQuery 遙測串流 bwg.agent_events)]
-    VD -.-> GCS[(Google Cloud Storage gs://...)]
-    GCS -.-> BQ_Visuals[(BigQuery Key Visuals 物件表格)]
-    BQ_Visuals -.-> Drift[AI.SCORE 品牌漂移評審與自動微調]
-```
-
-### 代理人分工表
-| 代理人角色 | 執行方式 | 責任範圍與輸出 |
-| :--- | :--- | :--- |
-| **Creative Director** | 本地 LLM (`gemini-3.8-flash`) | 發想核心概念標語（Concept Line）與行銷策略論述。 |
-| **Brand Strategist** | 本地 LLM (`gemini-3.8-flash`) | 定義品牌定位、目標受眾與溝通語調。 |
-| **Copywriter** | 本地 LLM (`gemini-3.8-flash`) | 嚴格生成 25 字以內的社群媒體貼文與行動呼籲（CTA）。 |
-| **Visual Director** | 遠端 A2A 微服務 (`SERVICE_ROLE=visual-director`) | 載入品牌指導規範（`brand-guidelines`），輸出藝術指導提示並透過 Imagen 生成 Key Visual 圖片存於 GCS。 |
+### 四大核心模組：
+1. **Module 1（擴展團隊）**：利用外部 YAML Frontmatter 的 `SKILL.md` 解耦領域規則，建立確定性合規評估測試套件，並透過 **Agent2Agent (A2A)** 協議將運算密集的視覺總監拆分為微服務。
+2. **Module 2（行為觀測）**：以 BigQuery Object Table 映射 GCS 圖檔資產，並在 SQL 中使用 `AI.SCORE` 實施多模態品牌漂移檢測與閉環提示詞自動調優。
+3. **Module 3（管線加固）**：以 `PreToolUse` 鉤子實施工具白名單與提示詞注入防禦、遞迴過濾 PII 敏感資料、並加入人機協同（HITL）審核閘門。
+4. **Module 4（權杖經濟學）**：透過記憶壓縮、滑動視窗歷史修剪與 SHA-256 靜態提示詞快取，大幅縮減上下文 Token 消耗。
 
 ---
 
-## 2. 專案運用之各項資源與技能 (Skills)
+## 2. 實驗環境與 Antigravity 2.0 協同範式
 
-### 2.1 自定義技能 (Custom Skills)
-- **`start-frontend`** (`.agents/skills/start-frontend/`): 管理本機伺服器連接埠生命週期，以背景守護程式（Daemon）啟動主應用程式（Port 8080）與 A2A 視覺服務（Port 8801）。
-- **`lab-helper`** (`.agents/skills/lab-helper/`): 診斷工作區代碼漂移，提供 3-Tier 漸進式提示（概念 $\rightarrow$ 檔案與符號 $\rightarrow$ 實作代碼）及外科手術式修復。
-- **`brand-guidelines`** (`pitch_generator/skills/brand-guidelines/`): 視覺美學領域技能，定義色盤、光影、構圖與嚴格禁制詞。
-
-### 2.2 雲端與資料基礎架構
-- **Google Cloud Run**: 部署無伺服器微服務容器（`pitch-generator` 與 `visual-director`）。
-- **Google Cloud Storage (GCS)**: 保存生成之主視覺 PNG 圖檔。
-- **Google BigQuery**:
-  - `bwg.agent_events`: 即時寫入每次執行之 Session、延遲、Token 與執行節點追蹤。
-  - `bwg.key_visuals`: 使用 `OBJ.MAKE_REF` 與 Cloud Resource 連線映射 GCS 物件。
-  - `bwg.brand_review`: 透過 `AI.SCORE` 實施品牌符合度評分。
+### 核心協同原則
+- **Why, Prompt, How 循環**：每個步驟皆由設計理由（The Why）、給 AI 的自然語言提示詞（Prompt）、以及 Antigravity 的具體程式碼變更與 diff（How Antigravity Implements This）構成。
+- **介面契約導向（Contract-based Review）**：因 LLM 生成存在非確定性（Non-deterministic），代碼變更主要檢驗核心類別、函數名稱與狀態鍵值（State Keys）是否符合規格。
+- **純 Prompt 驅動**：全程不需手動下達複雜終端指令，以自然語言提示詞完成開發、本機測試、驗證與雲端部署。
 
 ---
 
-## 3. Agentic Workflow 核心優勢與設計目的
+## 3. Starter Baseline 基準應用解析
 
-1. **關注點分離（Separation of Concerns）**：避免單一巨大提示詞產生幻覺；各代理人各司其職，提升輸出可控度與可靠度。
-2. **閉環自我修復（Closed-Loop Self-Healing）**：以評分模型（`AI.SCORE`）自動偵測提示詞漂移（$< 7.0$），並由 Python 自動剔除霓虹、浮水印等禁制詞後重試，直到評分符合規範。
-3. **成本與權杖可控（Predictable Tokenomics）**：藉由記憶壓縮、視窗截斷與靜態提示詞快取，大幅縮減多輪對話 Context 成本達 70% 以上。
-4. **安全防護優先（Security-First Design）**：落實「不信任任何輸入」原則，包含 PII 前置遮蔽、工具呼叫白名單校驗及審核失敗立即斷開機制。
-
----
-
-## 4. 核心技能原始定義 (Skill MD)
-
-### 4.1 品牌指引技能 (`brand-guidelines`)
-```markdown
----
-name: brand-guidelines
-description: Encapsulates house visual style rules and brand identity standards. Use when directing visual assets, setting art direction, or generating key visuals.
----
-
-# House Brand Visual Guidelines
-
-## Palette
-- Primary: Deep indigo, warm amber, slate, terracotta.
-- Accents: Subtle earth tones and natural textures.
-
-## Light
-- Warm raking golden-hour light with long soft shadows.
-- Low-angle directional sunlight creating cinematic depth and natural rim lighting.
-
-## Composition
-- Off-center hero subject placed along the rule of thirds.
-- Generous negative space and intentional breathing room.
-- Shallow depth of field with soft focal falloff and subtle background blur.
-
-## Subject
-- One realistic photographic subject.
-- Authentic, handcrafted materials and natural textures (linen, wood, stone, ceramic).
-- Believable, candid posture and natural expression.
-
-## Never
-- No neon or fluorescent colors (especially fluorescent cyan or magenta).
-- No watermarks, stock photo tags, text overlays, or logos.
-- No harsh flat overhead ring light or artificial flash glare.
-- No 3D renders, CGI look, plastic skin textures, or cartoon styling.
-```
-
-### 4.2 本地服務啟動技能 (`start-frontend`)
-```markdown
----
-name: start-frontend
-description: Manages local server ports and starts the Pitch Generator web server (port 8080) and optional standalone Visual Director A2A service (port 8801) as background daemon processes.
----
-
-# Pitch Generator Start Frontend Skill
-
-Enforces safe server lifecycle on ports 8080 and 8801:
-1. Check ports availability.
-2. Clean lingering processes.
-3. Launch FastAPI server as a background daemon process.
-4. Verify /healthz endpoint.
-```
+- **預設架構**：
+  - `Creative Director`：負責發想核心標語與策略論述。
+  - `Brand Strategist`：定義品牌定位與受眾分析。
+  - `Copywriter`：撰寫 25 字內社群文案與 CTA。
+  - `Visual Director`：生成畫面描述與透過 Imagen 生成 Key Visual。
+- **本機驗證**：
+  - 提示詞：`Test the agent with "Flying skateboards for cats" and show the pitch results, including the generated image.`
+  - 伺服器啟動：`Start the local server`（啟動於 `http://localhost:8080`）。
 
 ---
 
-## 5. 安全防護與治理機制
+## 4. Module 1: 專責代理人團隊擴展 (Skills & A2A)
 
-### 5.1 敏感資料去識別化 (PII Scrubber)
-- **實作位址**：`pitch_generator/app_utils/services.py` 之 `PIIScrubber` 與 `ScrubResult`。
-- **支援正規化規則**：
-  - API Keys / Bearer Token -> `[REDACTED_SECRET]`
-  - Credit Cards -> `[REDACTED_CC]`
-  - Social Security Numbers -> `[REDACTED_SSN]`
-  - Email Addresses -> `[REDACTED_EMAIL]`
-  - Phone Numbers -> `[REDACTED_PHONE]`
-- **特性**：採用 Deep Copy 保障調用端傳入資料之不可變性（Immutability），且精準保留標準 ISO 日期（`2026-10-15`）與業務指標（`350 lumen`, `45%`）。
+### Step 1a: Author and attach the brand guidelines skill
+- **問題**：將數百行品牌規則硬寫在 System Prompt 中會浪費每一輪的輸入 Token。
+- **解決方案**：將視覺規則抽離至外部 `pitch_generator/skills/brand-guidelines/SKILL.md`，代理人平時只讀取 Frontmatter 元數據，需要時才呼叫 `load_skill("brand-guidelines")` 載入本文。
+- **規範區塊**：`# Palette`、`# Light`、`# Composition`、`# Subject`、`# Never`。
+- **驗證 Prompt**：
+  > *"Run the Visual Director agent on 'Flying skateboards for cats with glowing neon lasers and a 3D chrome logo' and show how the brand-guidelines skill steers the art direction back to our house style."*
 
-### 5.2 工具呼叫前置攔截鉤子 (PreToolUse Hook)
-- **白名單政策**：僅允許 `load_skill` 與 `generate_key_visual`。
-- **過濾機制**：攔截未授權工具、路徑遍歷語法（`..` 或開頭 `/`）、覆蓋參數（如 `bypass_safety`）、超長字串（$>4096$ chars）及提示詞注入語句（`ignore previous instructions`）。
-- **審計紀錄**：每一次工具呼叫檢查皆寫入 `audit_log`。
+### Step 1b: Evaluate skill activation and brand compliance
+- **實作重點**：建立確定性評估模組（不需要在單元測試中花費昂貴的 LLM 評審調用），檢查 `loaded_skills`，對四大品牌支柱各打 0.25 分，並針對 `FORBIDDEN_BRAND_PATTERNS` 扣分。
+- **合格標準**：`loaded_skill == True` 且 `violations == []` 且 `score >= 0.75`。
 
-### 5.3 人機協同審核閘門 (HITL Approval Gate)
-- **工作節點**：`approve_concept` (`rerun_on_resume=False`) 與 `user_approval` (`rerun_on_resume=True`)。
-- **決策閉合**：
-  - `approved is None` -> 觸發暫停（`status="input_required"`），下游代理人呼叫次數為 0。
-  - `approved is False` -> 拒絕終止（`status="rejected"`），下游調用數為 0。
-  - `approved is True` -> 放行後續 `copywriter` 與 `visual_director` 節點。
+### Step 1c: Connect the remote A2A Visual Director service
+- **微服務架構**：圖片生成耗時且消耗大量 GPU/TPU 資源，將其拆解為獨立微服務。
+- **A2A 通訊**：
+  - 伺服端暴露 `/.well-known/agent-card.json` 與 `/a2a/visual_director`（連接埠 `8801`）。
+  - 用戶端實作 `RemoteA2aAgent`，本機走 `http://` 免驗證，生產環境 `https://` Cloud Run 自動附加 Google 簽名 OIDC Bearer Token（超時設定 600 秒）。
+  - 串流過濾器 `_pitch_parts_only`：過濾中途的 `function_call` 與 `function_response` JSON 片段，只保留最終生成的純文字與 PNG 圖檔。
 
 ---
 
-## 6. 權杖經濟學 (Tokenomics) 實作與基準測試
+## 5. Module 2: 企業級觀測與行為審計 (BigQuery & AI.SCORE)
 
-### 6.1 模組能力
-1. **確定性 Token 估算**：`max(1, len(text.strip()) // 4)`。
-2. **記憶壓縮 (`compress_memory`)**：最近 2 輪對話逐字保留，其餘自動歸納為 System Summary。
-3. **滑動視窗截斷 (`prune_history`)**：在設定的 `max_turns` 與 `max_tokens` 預算內截斷；單一超長訊息自動縮減並標註 `truncated=True`。
-4. **SHA-256 靜態提示詞快取 (`PromptCacheManager`)**：對品牌指導規範等長文字計算 64 碼 Hex Hash 並配置 TTL 快取。
-5. **模型階層路由器 (`select_model_strategy`)**：支援 `flash`、`pro`、`low`、`high` 與 `local` 5 種模型策略。
+### Step 2a: Enable agent analytics in BigQuery
+- **Object Tables 設計**：直接在資料庫儲存大圖檔會造成膨脹與查詢低效；BigQuery Object Table 透過 `OBJ.MAKE_REF(uri, '${REGION}.pitch-connection')` 映射 GCS 檔案，並以 `OBJ.FETCH_METADATA` 擷取元數據。
+- **遙測服務**：`BigQueryAnalyticsService` 實作 `record_telemetry` 與 `register_key_visuals`，強制校驗圖片 URI 必須以 `gs://` 開頭。
 
-### 6.2 10 輪對話實測基準數據 (Flying skateboards for cats)
-- **原始對話上下文**：10 輪對話，共 **257 Tokens**。
-- **記憶壓縮後**：濃縮為 3 輪（1 個摘要 + 2 輪最新），降低至 **230 Tokens**（節省 10.5%）。
-- **滑動視窗截斷後**：進一步過濾為 2 輪，降至 **55 Tokens**（節省 **78.6%**）。
-- **品牌指引快取表現**：
-  - 第一次請求（Pass 1 - Cache Miss）：`saved_tokens = 0`。
-  - 第二次請求（Pass 2 - Cache Hit）：命中快取，直接省下 **293 Tokens**。
-- **端到端總節省量**：**495 Tokens**。
+### Step 2b: Identify brand drift in BigQuery and tune prompts
+- **SQL 多模態審查**：
+  ```sql
+  SELECT *, IF(brand_fit >= 7, 'on brand', 'needs another pass') AS verdict
+  FROM AI.SCORE(TABLE bwg.key_visuals, ...)
+  ```
+- **閉環自動微調 (Closed-Loop Tuning)**：當檢測到漂移評分 $< 7.0$（`needs another pass`），Python 自動執行 `tune_prompt_and_skill` 移除霓虹、浮水印等違規字眼，並注入品牌正向準則，使重新評分達 $\ge 7.0$。
+
+---
+
+## 6. Module 3: 管線加固與縱深防禦 (Security & HITL)
+
+### Step 3a: Enforce tool policies with PreToolUse lifecycle hooks
+- **防禦目標**：防止對抗性提示詞調用惡意指令（如 `exec_shell`、`bash`）或傳入危險參數（如 `../../etc/passwd`）。
+- **實作原則**：Fail-closed 阻斷，工具白名單僅允許 `load_skill` 與 `generate_key_visual`；拒絕覆蓋參數（如 `bypass_safety`）、參數長度大於 4096 字元及提示詞注入語句。
+
+### Step 3b: Scrub sensitive PII data from inputs and outputs
+- **隱私規範**：行銷簡報常包含聯絡電話、郵箱或機密金鑰。在進入模型或日誌前，透過遞迴正則表達式取代敏感資訊（`[REDACTED_SECRET]`、`[REDACTED_CC]`、`[REDACTED_EMAIL]` 等）。
+- **不變性保證**：以深拷貝（Deep Copy）處理嵌套資料結構，確保呼叫端傳入物件不被原地修改，且保留合法日期（`2026-10-15`）與轉換率數據。
+
+### Step 3c: Add human-in-the-loop approval gates
+- **ADK 兩階段節點模式**：
+  - `approve_concept`：標註 `@node(rerun_on_resume=False)`，在暫停等待時發送 `RequestInput`，恢復執行後不重複發送。
+  - `user_approval`：標註 `@node(rerun_on_resume=True)`，在恢復時重新評估審核意見，若使用者輸入不是肯定意圖（"yes" 或 "y"），拋出 `ValueError` 中斷下游文案與視覺生成，落實 Fail-closed。
+
+---
+
+## 7. Module 4: 規模化與權杖經濟學最佳化 (Tokenomics)
+
+### Step 4a: Implement tokenomics with compression, pruning, and caching
+- **三項核心優化手法**：
+  1. **Memory Compression（記憶壓縮）**：`compress_memory(turns, keep_recent=2)` 將第 3 輪以前的舊對話壓縮為單一 System Summary，最近 2 輪完整保留。
+  2. **History Pruning（歷史修剪）**：`prune_history(turns, max_turns=6, max_tokens=512)` 依據滑動視窗維護最新輪次，若單一訊息超過預算則截斷並標記 `truncated=True`。
+  3. **Prompt Caching（提示詞快取）**：以 SHA-256 對靜態品牌指引計算 64 碼 Hash，於有效 TTL 內重複利用快取前綴，避免重複解析。
+  4. **Model Tier Routing（模型分級路由）**：提供 `flash`、`pro`、`low`、`high` 與 `local` 5 種模型策略適應不同成本場景。
+
+---
+
+## 8. 自我排錯與 Lab Helper 漸進式引導機制
+
+實驗室內建了由自然語言提示驅動的排錯引擎（`.agents/skills/lab-helper/`）：
+- **Tier 1 (Conceptual Nudge)**：提供高層架構設計理念提示。
+- **Tier 2 (Targeted File and Symbol Hint)**：指出特定檔案路徑、函式簽名或缺少的變數名稱。
+- **Tier 3 (Implementation Blueprint)**：提供具體的程式碼修復範例。
+- **Remediation**：若完全卡住，自動進行在位外科手術式修復（保留使用者先前的其他自訂程式碼與後續 guidepost）。
+
+---
+
+## 9. 本地資源檔案索引
+
+- **原始線上教材**：[https://storage.googleapis.com/bwg-track5-demo-guide/index.html](https://storage.googleapis.com/bwg-track5-demo-guide/index.html)
+- **本地完整 HTML 離線講義**：[`docs/guide_local.html`](file:///config/Desktop/BuildWithGemini/docs/guide_local.html)（支援深色/淺色主題切換、排版與外部圖片映射）
+- **本地提取之原始 Markdown**：[`docs/GUIDE_ORIGINAL.md`](file:///config/Desktop/BuildWithGemini/docs/GUIDE_ORIGINAL.md)
+- **本地深度解析與架構綜整**：[`docs/GUIDE_DETAILED_SUMMARY.md`](file:///config/Desktop/BuildWithGemini/docs/GUIDE_DETAILED_SUMMARY.md)
